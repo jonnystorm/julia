@@ -649,15 +649,22 @@ end
 cache_file_entry(pkg::PkgId) = joinpath(
     "compiled",
     "v$(VERSION.major).$(VERSION.minor)",
-    pkg.uuid === nothing ? "$(pkg.name).ji" : joinpath(pkg.name, "$(package_slug(pkg.uuid)).ji")
-)
+    pkg.uuid === nothing ? ""       : pkg.name),
+    pkg.uuid === nothing ? pkg.name : package_slug(pkg.uuid)
 
 function find_all_in_cache_path(pkg::PkgId)
     paths = String[]
-    entry = cache_file_entry(pkg)
-    for depot in DEPOT_PATH
-        path = joinpath(depot, entry)
-        isfile_casesensitive(path) && push!(paths, path)
+    entrypath, entryfile = cache_file_entry(pkg)
+    for path in joinpath.(DEPOT_PATH, entrypath)
+        isdir(path) || continue
+        for file in readdir(path)
+            if !((pkg.uuid === nothing && file == entryfile * ".ji") ||
+                 (pkg.uuid !== nothing && startswith(file, entryfile * "_")))
+                 continue
+            end
+            filepath = joinpath(path, file)
+            isfile_casesensitive(filepath) && push!(paths, filepath)
+        end
     end
     return paths
 end
@@ -1222,11 +1229,25 @@ function compilecache(pkg::PkgId)
     path === nothing && throw(ArgumentError("$pkg not found during precompilation"))
     return compilecache(pkg, path)
 end
+
+const MAX_NUM_PRECOMPILE_FILES = 10
+
 function compilecache(pkg::PkgId, path::String)
     # decide where to put the resulting cache file
-    cachefile = abspath(DEPOT_PATH[1], cache_file_entry(pkg))
-    cachepath = dirname(cachefile)
+    entrypath, entryfile = cache_file_entry(pkg)
+    cachepath = joinpath(DEPOT_PATH[1], entrypath)
     isdir(cachepath) || mkpath(cachepath)
+    if pkg.uuid === nothing
+       cachefile = abspath(cachepath, entryfile) * ".ji"
+    else
+        candidates = filter!(x -> startswith(x, entryfile * "_"), readdir(cachepath))
+        if length(candidates) < MAX_NUM_PRECOMPILE_FILES
+            idx = length(candidates)
+        else
+            idx = findmin(mtime.(joinpath.(cachepath, candidates)))[2] - 1
+        end
+        cachefile = abspath(cachepath, string(entryfile, "_", idx, ".ji"))
+    end
     # build up the list of modules that we want the precompile process to preserve
     concrete_deps = copy(_concrete_dependencies)
     for (key, mod) in loaded_modules
@@ -1236,11 +1257,7 @@ function compilecache(pkg::PkgId, path::String)
     end
     # run the expression and cache the result
     verbosity = isinteractive() ? CoreLogging.Info : CoreLogging.Debug
-    if isfile(cachefile)
-        @logmsg verbosity "Recompiling stale cache file $cachefile for $pkg"
-    else
-        @logmsg verbosity "Precompiling $pkg"
-    end
+    @logmsg verbosity "Precompiling $pkg"
     p = create_expr_cache(path, cachefile, concrete_deps, pkg.uuid)
     if success(p)
         # append checksum to the end of the .ji file:
